@@ -1,22 +1,22 @@
-local M = {}
+local specs = {}
 local opts = {}
+local module = { active = {} }
 
 local old_cur
 local au_toggle
 
-function M.on_cursor_moved()
-  local cur = vim.api.nvim_win_get_cursor(0)
-  if old_cur then
-    local jump = math.abs(cur[1] - old_cur[1])
-    if jump >= opts.min_jump then
-      M.show_specs()
-    end
+local function end_repeat(timer, winid)
+  if timer then
+    pcall(vim.loop.close, timer)
   end
-  old_cur = cur
+
+  pcall(vim.api.nvim_win_close, winid, true)
+
+  module.active[winid] = nil
 end
 
-function M.should_show_specs(start_bufnr, start_win_id)
-  if not vim.api.nvim_win_is_valid(start_win_id) then
+local function should_show_specs(start_winid)
+  if not vim.api.nvim_win_is_valid(start_winid) then
     return false
   end
 
@@ -38,18 +38,37 @@ function M.should_show_specs(start_bufnr, start_win_id)
   return true
 end
 
-function M.show_specs()
-  local start_win_id = vim.api.nvim_get_current_win()
-  local start_bufnr = vim.api.nvim_get_current_buf()
+function specs.close_active()
+  for winid, _ in pairs(module.active) do
+    end_repeat(nil, winid)
+  end
+end
 
-  if not M.should_show_specs(start_bufnr, start_win_id) then
+function specs.on_cursor_moved()
+  local cur = vim.api.nvim_win_get_cursor(0)
+
+  if old_cur then
+    local jump = math.abs(cur[1] - old_cur[1])
+
+    if jump >= opts.min_jump then
+      specs.show_specs()
+    end
+  end
+
+  old_cur = cur
+end
+
+function specs.show_specs()
+  local start_winid = vim.api.nvim_get_current_win()
+
+  if not should_show_specs(start_winid) then
     return
   end
 
   local cursor_col = vim.fn.wincol() - 1
   local cursor_row = vim.fn.winline() - 1
-  local bufh = vim.api.nvim_create_buf(false, true)
-  local win_id = vim.api.nvim_open_win(bufh, false, {
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  local winid = vim.api.nvim_open_win(bufnr, false, {
     relative = "win",
     width = 1,
     height = 1,
@@ -57,11 +76,13 @@ function M.show_specs()
     row = cursor_row,
     style = "minimal",
   })
-  vim.api.nvim_win_set_option(win_id, "winhl", "Normal:" .. opts.popup.winhl)
-  vim.api.nvim_win_set_option(win_id, "winblend", opts.popup.blend)
+
+  module.active[winid] = { winid = winid, bufnr = bufnr }
+  vim.api.nvim_win_set_option(winid, "winhl", "Normal:" .. opts.popup.winhl)
+  vim.api.nvim_win_set_option(winid, "winblend", opts.popup.blend)
 
   local cnt = 0
-  local config = vim.api.nvim_win_get_config(win_id)
+  local config = vim.api.nvim_win_get_config(winid)
   local timer = vim.loop.new_timer()
   local closed = false
 
@@ -70,10 +91,9 @@ function M.show_specs()
     opts.popup.delay_ms,
     opts.popup.inc_ms,
     vim.schedule_wrap(function()
-      if closed or vim.api.nvim_get_current_win() ~= start_win_id then
+      if closed or vim.api.nvim_get_current_win() ~= start_winid then
         if not closed then
-          pcall(vim.loop.close, timer)
-          pcall(vim.api.nvim_win_close, win_id, true)
+          end_repeat(timer, winid)
 
           -- Callbacks might stack up before the timer actually gets closed, track that state
           -- internally here instead
@@ -83,22 +103,24 @@ function M.show_specs()
         return
       end
 
-      if vim.api.nvim_win_is_valid(win_id) then
+      if vim.api.nvim_win_is_valid(winid) then
         local bl = opts.popup.fader(opts.popup.blend, cnt)
         local dm = opts.popup.resizer(opts.popup.width, cursor_col, cnt)
 
         if bl ~= nil then
-          vim.api.nvim_win_set_option(win_id, "winblend", bl)
+          vim.api.nvim_win_set_option(winid, "winblend", bl)
         end
+
         if dm ~= nil then
           config["col"][false] = dm[2]
-          vim.api.nvim_win_set_config(win_id, config)
-          vim.api.nvim_win_set_width(win_id, dm[1])
+          vim.api.nvim_win_set_config(winid, config)
+          vim.api.nvim_win_set_width(winid, dm[1])
         end
+
         if bl == nil and dm == nil then -- Done blending and resizing
-          vim.loop.close(timer)
-          vim.api.nvim_win_close(win_id, true)
+          end_repeat(timer, winid)
         end
+
         cnt = cnt + 1
       end
     end)
@@ -108,7 +130,7 @@ end
 --[[ ▁▁▂▂▃▃▄▄▅▅▆▆▇▇██ ]]
 --
 
-function M.linear_fader(blend, cnt)
+function specs.linear_fader(blend, cnt)
   if blend + cnt <= 100 then
     return cnt
   else
@@ -119,7 +141,7 @@ end
 --[[ ▁▁▁▁▂▂▂▃▃▃▄▄▅▆▇ ]]
 --
 
-function M.exp_fader(blend, cnt)
+function specs.exp_fader(blend, cnt)
   if blend + math.floor(math.exp(cnt / 10)) <= 100 then
     return blend + math.floor(math.exp(cnt / 10))
   else
@@ -130,7 +152,7 @@ end
 --[[ ▁▂▃▄▅▆▇█▇▆▅▄▃▂▁ ]]
 --
 
-function M.pulse_fader(blend, cnt)
+function specs.pulse_fader(blend, cnt)
   if cnt < (100 - blend) / 2 then
     return cnt
   elseif cnt < 100 - blend then
@@ -143,14 +165,14 @@ end
 --[[ ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ ]]
 --
 
-function M.empty_fader(_, _)
+function specs.empty_fader(_, _)
   return nil
 end
 
 --[[ ░░▒▒▓█████▓▒▒░░ ]]
 --
 
-function M.shrink_resizer(width, ccol, cnt)
+function specs.shrink_resizer(width, ccol, cnt)
   if width - cnt > 0 then
     return { width - cnt, ccol - (width - cnt) / 2 + 1 }
   else
@@ -161,7 +183,7 @@ end
 --[[ ████▓▓▓▒▒▒▒░░░░ ]]
 --
 
-function M.slide_resizer(width, ccol, cnt)
+function specs.slide_resizer(width, ccol, cnt)
   if width - cnt > 0 then
     return { width - cnt, ccol }
   else
@@ -172,7 +194,7 @@ end
 --[[ ███████████████ ]]
 --
 
-function M.empty_resizer(width, ccol, cnt)
+function specs.empty_resizer(width, ccol, cnt)
   if cnt < 100 then
     return { width, ccol - width / 2 }
   else
@@ -189,8 +211,8 @@ local DEFAULT_OPTS = {
     blend = 10,
     width = 20,
     winhl = "PMenu",
-    fader = M.exp_fader,
-    resizer = M.shrink_resizer,
+    fader = specs.exp_fader,
+    resizer = specs.shrink_resizer,
   },
   ignore_filetypes = {},
   ignore_buftypes = {
@@ -198,34 +220,38 @@ local DEFAULT_OPTS = {
   },
 }
 
-function M.setup(user_opts)
+function specs.setup(user_opts)
   opts = vim.tbl_deep_extend("force", DEFAULT_OPTS, user_opts)
-  M.create_autocmds()
+  specs.create_autocmds()
 end
 
-function M.toggle()
+function specs.toggle()
   if au_toggle then
-    M.clear_autocmds()
+    specs.clear_autocmds()
   else
-    M.create_autocmds()
+    specs.create_autocmds()
   end
 end
 
-function M.create_autocmds()
+function specs.create_autocmds()
   vim.cmd("augroup Specs")
   vim.cmd("autocmd!")
+
   if opts.show_jumps then
     vim.cmd("silent autocmd CursorMoved * :lua require('specs').on_cursor_moved()")
   end
+
+  vim.cmd("silent autocmd WinLeave * :lua require('specs').close_active()")
+
   vim.cmd("augroup END")
   au_toggle = true
 end
 
-function M.clear_autocmds()
+function specs.clear_autocmds()
   vim.cmd("augroup Specs")
   vim.cmd("autocmd!")
   vim.cmd("augroup END")
   au_toggle = false
 end
 
-return M
+return specs
